@@ -13,7 +13,11 @@ polygon is actually your reference house.
 
 PHASE 2 (confirm): paste the confirmed index (or Overture id) for
 each reference point into CONFIRMED below, rerun - it computes the
-calibrated MIN/MAX from those exact, visually-verified footprints.
+calibrated MIN/MAX from those exact, visually-verified footprints,
+AND exports an isolation-calibration KMZ (isolation_calibration.kmz)
+showing each confirmed house plus its nearby neighbors with distance
+labels, so you can visually judge in Google Earth whether that gap
+matches what you'd call "standalone" before trusting a threshold.
 
 SETUP
     pip install overturemaps geopandas shapely simplekml
@@ -25,7 +29,7 @@ USAGE
     4. For each reference point's folder, click through the numbered
        candidates against satellite imagery until you find the one
        that's actually your house. Note its index number.
-    5. Fill in CONFIRMED = {"label": index, ...} below. i.e CONFIRMED = {"idealHouse1": 2, "salau": 0}
+    5. Fill in CONFIRMED = {"label": index, ...} below.
     6. Run again - now it prints the calibrated MIN/MAX range.
 """
 
@@ -59,7 +63,12 @@ CONFIRMED = {"idealHouse1": 10, "salau": 3}
 
 MARGIN = 0.2  # +/- margin around observed min/max, as a fraction
 
+# how far to search around a confirmed building for isolation
+# calibration, in meters
+ISOLATION_SEARCH_RADIUS_M = 60
+
 OUTPUT_KMZ = "calibration_candidates.kmz"
+ISOLATION_KMZ = "isolation_calibration.kmz"
 
 # ============================================================
 
@@ -86,6 +95,72 @@ def get_candidates(lat, lon, radius_deg):
     gdf["dist_m"] = gdf_m.geometry.distance(pt_m).values
 
     return gdf.sort_values("dist_m").reset_index(drop=True)
+
+
+def get_nearby_buildings(geom_wgs84, radius_m):
+    """All buildings within radius_m meters of a footprint (for
+    isolation calibration) - a plain bbox pull around the footprint's
+    centroid, generous enough to catch neighbors."""
+    centroid = geom_wgs84.centroid
+    deg = radius_m / 111000  # rough deg-per-meter, fine at this scale
+    bbox = (centroid.x - deg, centroid.y - deg, centroid.x + deg, centroid.y + deg)
+    reader = overturemaps.record_batch_reader("building", bbox=bbox, stac=True)
+    table = reader.read_all()
+    if table.num_rows == 0:
+        return gpd.GeoDataFrame(columns=["id", "geometry"], geometry="geometry", crs="EPSG:4326")
+    df = table.to_pandas()
+    geoms = df["geometry"].apply(wkb.loads)
+    return gpd.GeoDataFrame(df, geometry=geoms, crs="EPSG:4326")
+
+
+def compute_isolation(row, radius_m=ISOLATION_SEARCH_RADIUS_M):
+    """Distance from this confirmed building to its nearest OTHER
+    building, plus the full nearby set (for visual export)."""
+    nearby = get_nearby_buildings(row.geometry, radius_m)
+    if nearby.empty:
+        return None, nearby
+
+    nearby_m = nearby.to_crs(nearby.estimate_utm_crs())
+    this_m = gpd.GeoSeries([row.geometry], crs="EPSG:4326").to_crs(nearby_m.crs).iloc[0]
+
+    dists = nearby_m.geometry.apply(lambda g: this_m.distance(g))
+    others = dists[dists > 0.01]  # exclude itself (distance ~0)
+    if others.empty:
+        return None, nearby
+
+    return others.min(), nearby
+
+
+def export_isolation_kmz(confirmed_rows, path):
+    kml = simplekml.Kml()
+    for label, row, nearest_dist, nearby in confirmed_rows:
+        folder = kml.newfolder(name=f"{label} (nearest neighbor: {nearest_dist:.0f}m)")
+
+        exterior = list(row.geometry.exterior.coords)
+        pol = folder.newpolygon(name=f"{label} (confirmed)", outerboundaryis=exterior)
+        pol.style.linestyle.color = simplekml.Color.green
+        pol.style.linestyle.width = 3
+        pol.style.polystyle.color = simplekml.Color.changealphaint(100, simplekml.Color.green)
+
+        centroid = row.geometry.centroid
+        for _, other in nearby.iterrows():
+            other_centroid = other.geometry.centroid
+            if other_centroid.distance(centroid) < 1e-9:
+                continue
+            other_exterior = list(other.geometry.exterior.coords)
+            opol = folder.newpolygon(name="neighbor", outerboundaryis=other_exterior)
+            opol.style.linestyle.color = simplekml.Color.yellow
+            opol.style.linestyle.width = 1
+            opol.style.polystyle.color = simplekml.Color.changealphaint(40, simplekml.Color.yellow)
+
+            line = folder.newlinestring(
+                name=f"{centroid.distance(other_centroid) * 111000:.0f}m (centroid-to-centroid, approx)",
+                coords=[(centroid.x, centroid.y), (other_centroid.x, other_centroid.y)],
+            )
+            line.style.linestyle.color = simplekml.Color.white
+            line.style.linestyle.width = 1
+
+    kml.savekmz(path)
 
 
 def export_candidates_kmz(all_candidates, path):
@@ -136,14 +211,26 @@ def main():
     log("")
     log("CONFIRMED provided - computing calibration from confirmed footprints:")
     areas = []
+    isolation_rows = []
     for label, idx in CONFIRMED.items():
         gdf = all_candidates.get(label)
         if gdf is None or idx not in gdf.index:
             log(f"  '{label}' index {idx}: NOT FOUND - check the index is valid")
             continue
-        area = gdf.loc[idx, "area_sqm"]
+        row = gdf.loc[idx]
+        area = row["area_sqm"]
         log(f"  '{label}' [{idx}]: {area:.0f} sqm (confirmed)")
         areas.append(area)
+
+        log(f"    computing isolation distance for '{label}'...")
+        nearest_dist, nearby = compute_isolation(row)
+        if nearest_dist is None:
+            log(f"    no other buildings found within {ISOLATION_SEARCH_RADIUS_M}m - "
+                f"very isolated, or search radius too small")
+        else:
+            log(f"    nearest neighbor: {nearest_dist:.1f}m away "
+                f"({len(nearby)} buildings in search radius)")
+            isolation_rows.append((label, row, nearest_dist, nearby))
 
     if not areas:
         log("No confirmed footprints resolved - nothing to calibrate.")
@@ -154,10 +241,26 @@ def main():
     sug_max = obs_max * (1 + MARGIN)
 
     log("")
-    log(f"Observed range: {obs_min:.0f}-{obs_max:.0f} sqm")
+    log(f"Observed footprint range: {obs_min:.0f}-{obs_max:.0f} sqm")
     log(f"Suggested filter (with {MARGIN*100:.0f}% margin):")
     log(f"  MIN_FOOTPRINT_SQM = {sug_min:.0f}")
     log(f"  MAX_FOOTPRINT_SQM = {sug_max:.0f}")
+
+    if isolation_rows:
+        export_isolation_kmz(isolation_rows, ISOLATION_KMZ)
+        dists = [d for _, _, d, _ in isolation_rows]
+        obs_min_iso = min(dists)
+        sug_iso = obs_min_iso * (1 - MARGIN)
+        log("")
+        log(f"Observed isolation distances: {', '.join(f'{d:.0f}m' for d in dists)}")
+        log(f"Suggested MIN_ISOLATION_METERS = {sug_iso:.0f} "
+            f"(smallest confirmed gap, minus {MARGIN*100:.0f}% margin so "
+            f"your own reference houses still pass)")
+        log(f"Wrote {ISOLATION_KMZ} - open in Google Earth: each confirmed "
+            f"house is outlined in green, its nearby buildings in yellow, "
+            f"with white lines labeled by distance. Check the suggested "
+            f"threshold visually - if a labeled gap doesn't look like a real "
+            f"compound boundary to you, adjust MIN_ISOLATION_METERS by hand.")
 
 
 if __name__ == "__main__":

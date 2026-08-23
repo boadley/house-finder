@@ -31,6 +31,7 @@ USAGE
     or chunk size - every one of those is just a variable below.
 """
 
+import os
 import time
 
 import geopandas as gpd
@@ -65,12 +66,20 @@ TRAVEL_PROFILE = "driving-car"   # also: "foot-walking", "cycling-regular"
 MIN_FOOTPRINT_SQM = 90
 MAX_FOOTPRINT_SQM = 106
 
+# Isolation filter: minimum distance (meters) from a candidate's
+# footprint edge to the nearest OTHER building's edge, in any
+# direction. This is the actual proxy for "alone in the compound" -
+# footprint size alone doesn't distinguish a standalone bungalow from
+# one unit in a row of identical attached/face-me-face-you buildings.
+# Set to None to disable.
+MIN_ISOLATION_METERS = 3
+
 # How many buildings per output KMZ. Buildings are sorted along a
 # space-filling curve first, so each chunk is a geographically
 # contiguous cluster, not a random scatter across the whole AOI.
-CHUNK_SIZE = 200
+CHUNK_SIZE = 55
 
-OUTPUT_PREFIX = "candidate_buildings"  # files: candidate_buildings_001.kmz, ...
+OUTPUT_PREFIX = "15min_driving_candidate_buildings"  # files: candidate_buildings_001.kmz, ...
 
 # ============================================================
 # STEP 1 - real road-network isochrone via OpenRouteService
@@ -124,15 +133,57 @@ def get_buildings_in_bbox(iso_gdf):
 def filter_buildings(buildings, iso_gdf):
     clipped = gpd.clip(buildings, iso_gdf)
 
-    # project to a local metric CRS for accurate area in sqm
+    # project to a local metric CRS for accurate area/distance in meters
     # (UTM zone 31N covers this part of Nigeria)
     clipped_m = clipped.to_crs("EPSG:32631")
     clipped["area_sqm"] = clipped_m.geometry.area
 
-    matches = clipped[
+    size_ok = (
         (clipped["area_sqm"] >= MIN_FOOTPRINT_SQM)
         & (clipped["area_sqm"] <= MAX_FOOTPRINT_SQM)
-    ].copy()
+    )
+    matches = clipped[size_ok].copy()
+
+    if MIN_ISOLATION_METERS is not None and len(matches) > 0:
+        matches = filter_by_isolation(matches, clipped_m, clipped)
+
+    return matches
+
+
+def filter_by_isolation(matches, all_buildings_m, all_buildings_wgs84):
+    """
+    Keeps only candidates whose nearest OTHER building (from the full
+    building set, not just size-matches) is at least
+    MIN_ISOLATION_METERS away. Uses all_buildings_m's spatial index
+    so this stays fast even with tens of thousands of buildings in
+    the bbox.
+    """
+    log(f"  applying isolation filter (>= {MIN_ISOLATION_METERS}m from any neighbor)...")
+    matches_m = matches.to_crs("EPSG:32631")
+    sindex = all_buildings_m.sindex
+
+    keep = []
+    for idx, geom in zip(matches_m.index, matches_m.geometry):
+        # search a small buffer around the candidate for nearby buildings
+        search_box = geom.buffer(MIN_ISOLATION_METERS)
+        nearby_idx = list(sindex.intersection(search_box.bounds))
+
+        is_isolated = True
+        for j in nearby_idx:
+            other_geom = all_buildings_m.geometry.iloc[j]
+            other_id = all_buildings_wgs84["id"].iloc[j] if "id" in all_buildings_wgs84.columns else None
+            this_id = matches["id"].loc[idx] if "id" in matches.columns else None
+            if other_id is not None and other_id == this_id:
+                continue  # skip comparing the candidate against itself
+            if geom.distance(other_geom) < MIN_ISOLATION_METERS:
+                is_isolated = False
+                break
+
+        keep.append(is_isolated)
+
+    filtered = matches[keep].copy()
+    log(f"  {len(matches)} -> {len(filtered)} after isolation filter")
+    return filtered
     return matches
 
 
@@ -157,7 +208,9 @@ def _morton_key(x, y, bits=16):
 
 
 def sort_by_locality(matches):
-    centroids = matches.geometry.centroid
+    # project to a metric CRS before computing centroid - centroid on
+    # lat/lon geometry directly is inaccurate (and triggers a warning)
+    centroids = matches.geometry.to_crs("EPSG:32631").centroid.to_crs("EPSG:4326")
     xs, ys = centroids.x.values, centroids.y.values
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
@@ -232,7 +285,8 @@ def export_chunked_kmz(matches, iso_gdf, prefix, chunk_size):
     for i in range(n_chunks):
         chunk = ordered.iloc[i * chunk_size : (i + 1) * chunk_size]
         chunk_label = f"Chunk {i+1} of {n_chunks}"
-        filename = f"{prefix}_{str(i+1).zfill(pad)}.kmz"
+        filename = os.path.join(os.path.dirname(prefix) or ".", "chunks", f"{os.path.basename(prefix)}_{str(i+1).zfill(pad)}.kmz")
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         export_chunk_kmz(chunk, iso_gdf, filename, chunk_label)
         log(f"  {filename}: {len(chunk)} buildings")
 

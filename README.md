@@ -33,6 +33,70 @@ can differ from what you'd estimate eyeballing satellite imagery -
 calibrating against the same source you're filtering against keeps
 the comparison apples-to-apples.
 
+## Isolation filter — the actual "alone in the compound" check
+
+`MIN_FOOTPRINT_SQM`/`MAX_FOOTPRINT_SQM` only checks size, not whether
+a building is standalone — a bungalow-sized unit in a row of four
+identical attached units passes the size filter just as easily as a
+genuinely standalone one. `MIN_ISOLATION_METERS` filters those out by
+checking the distance from each candidate to its nearest *other*
+building (using the full building set in the bbox, not just size
+matches) and dropping anything with a neighbor closer than that
+threshold. This is the highest-leverage lever if your candidate list
+is still much larger than your local contact can visit — set it to
+None to disable, or tune it up/down based on how tightly-packed
+buildings typically sit in your target streets.
+
+This is a proxy, not a guarantee — it can't see an actual compound
+wall, only building-to-building clearance. Pair it with a manual
+satellite pass over the surviving candidates in Google Earth, where
+compound walls themselves are usually visible, before dispatching a
+final list to your contact.
+
+To calibrate `MIN_ISOLATION_METERS` visually instead of guessing: it
+now runs automatically as part of `calibrate.py`'s confirm phase — no
+extra step needed. Once you've confirmed your reference buildings for
+footprint-size calibration, the script also computes each one's real
+distance to its nearest neighbor and writes `isolation_calibration.kmz`,
+with each confirmed house outlined in green, nearby buildings in
+yellow, and white lines labeled with the distance to each. Open it in
+Google Earth and sanity-check that the suggested threshold actually
+corresponds to what looks like a real compound boundary on the
+imagery, not just a number.
+
+## Route optimization (optional, separate script)
+
+`optimize_route.py` is completely separate from the main pipeline —
+it never runs automatically, only when you call it. Point it at a
+KMZ (typically one of `find_buildings.py`'s chunked output files) and
+it reorders the buildings into an efficient visiting sequence,
+drawing a route line and numbering the stops:
+
+```
+pip install openrouteservice simplekml
+python optimize_route.py candidate_buildings_001.kmz candidate_buildings_001_routed.kmz
+```
+
+Useful flags:
+- `--start-lat LAT --start-lon LON` — fix a starting point (e.g. your
+  contact's home, or wherever they'll actually start the day from).
+  Without this, it tries to find whichever starting building gives
+  the shortest overall route (only for chunks ≤30 buildings — larger
+  chunks start from whichever building is nearest the group's
+  centroid, since trying every possible start gets slow above that).
+- `--profile foot-walking` — if your contact is walking, not driving.
+- `--no-matrix` — skip the real-road-distance ORS API call and use
+  straight-line distance instead. Faster, no API quota used, but less
+  accurate where roads wind. This also kicks in automatically if the
+  ORS matrix call fails (e.g. `--ors-api-key` not provided, or the
+  chunk is too large for one request), so a real key isn't strictly
+  required to get a route — just a straight-line-optimized one.
+- `--ors-api-key YOUR_KEY` — reuses the same key from `find_buildings.py`.
+
+The output KMZ has a blue route line (survives OsmAnd's KML import,
+since lines aren't dropped like polygons are) plus numbered pins in
+visiting order.
+
 ## Every time you want a new/adjusted map
 
 Open `find_buildings.py` and edit the CONFIG block at the top:
