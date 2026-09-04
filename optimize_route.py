@@ -45,7 +45,7 @@ import math
 import time
 import zipfile
 from xml.etree import ElementTree as ET
-
+import openrouteservice
 import simplekml
 
 KML_NS = "{http://www.opengis.net/kml/2.2}"
@@ -120,7 +120,6 @@ def straight_line_matrix(buildings):
 
 
 def ors_matrix(buildings, profile, api_key):
-    import openrouteservice
     client = openrouteservice.Client(key=api_key)
     locations = [[b["lon"], b["lat"]] for b in buildings]
     result = client.distance_matrix(
@@ -231,12 +230,47 @@ def centroid_start_route(buildings, matrix):
 # STEP 4 - export routed KMZ
 # ============================================================
 
-def export_routed_kmz(buildings, route, path):
+def get_route_geometry(buildings, route, profile, api_key, use_matrix):
+    coords = [(buildings[i]["lon"], buildings[i]["lat"]) for i in route]
+    if not use_matrix or not api_key or api_key == "PASTE_YOUR_FREE_ORS_KEY_HERE":
+        log("  skipping ORS directions (no API key or --no-matrix set)")
+        return coords
+    
+    client = openrouteservice.Client(key=api_key)
+    
+    full_geometry = []
+    chunk_size = 40
+    
+    log("  requesting real-road route geometry from ORS...")
+    try:
+        for i in range(0, len(coords) - 1, chunk_size - 1):
+            chunk = coords[i:i + chunk_size]
+            if len(chunk) < 2:
+                break
+            result = client.directions(
+                coordinates=chunk,
+                profile=profile,
+                format='geojson'
+            )
+            geom = result['features'][0]['geometry']['coordinates']
+            
+            if i > 0 and len(full_geometry) > 0 and len(geom) > 0:
+                geom = geom[1:]
+                
+            full_geometry.extend(geom)
+            
+        log("  route geometry received")
+        return full_geometry
+    except Exception as e:
+        log(f"  ORS directions request failed ({e}) - falling back to straight lines")
+        return coords
+
+
+def export_routed_kmz(buildings, route, route_coords, path):
     kml = simplekml.Kml()
 
     line_folder = kml.newfolder(name="Route")
-    coords = [(buildings[i]["lon"], buildings[i]["lat"]) for i in route]
-    line = line_folder.newlinestring(name="Visiting route", coords=coords)
+    line = line_folder.newlinestring(name="Visiting route", coords=route_coords)
     line.style.linestyle.color = simplekml.Color.blue
     line.style.linestyle.width = 4
 
@@ -299,8 +333,11 @@ def main():
         route = centroid_start_route(buildings, matrix)
     log(f"  done in {time.time() - t0:.1f}s, total route cost: {route_length(route, matrix):.0f}")
 
+    use_matrix = not args.no_matrix
+    route_coords = get_route_geometry(buildings, route, args.profile, args.ors_api_key, use_matrix)
+
     log(f"Writing {args.output_kmz}...")
-    export_routed_kmz(buildings, route, args.output_kmz)
+    export_routed_kmz(buildings, route, route_coords, args.output_kmz)
     log("Done.")
 
 
