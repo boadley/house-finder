@@ -160,3 +160,7 @@ once you've picked candidates.
 - The Overture release path in the script (`2025-08-20.0`) may age out;
   check https://docs.overturemaps.org for the current release if the
   query returns nothing.
+
+## Full command
+
+`python optimize_route.py chunks/15min_driving_candidate_buildings_28.kmz routes/15min_driving_candidate_buildings_28_route.kmz --start-lat 7.136823441977621 --start-lon 3.332508859664971 --ors-api-key eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjdkN2VhMzc0NmExNjRhNTNhOTliOWU4N2FkMTQwOTgwIiwiaCI6Im11cm11cjY0In0=`
